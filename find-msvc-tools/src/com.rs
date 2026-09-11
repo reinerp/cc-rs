@@ -98,6 +98,9 @@ impl BStr {
         BStr(s)
     }
     pub fn to_osstring(&self) -> OsString {
+        if self.0.is_null() {
+            return OsString::new();
+        }
         let len = unsafe { SysStringLen(self.0) };
         let slice = unsafe { from_raw_parts(self.0, len as usize) };
         OsStringExt::from_wide(slice)
@@ -107,4 +110,9 @@ impl Drop for BStr {
     fn drop(&mut self) {
         unsafe { SysFreeString(self.0) };
     }
+}
+
+#[test]
+fn null_bstr_is_empty() {
+    assert_eq!(BStr(null()).to_osstring(), OsString::new());
 }
