@@ -94,9 +94,8 @@
 //! * `CC_FORCE_DISABLE` - If set, `cc` will never run any [`Command`]s, and methods that
 //!   would return an [`Error`]. This is intended for use by third-party build systems
 //!   which want to be absolutely sure that they are in control of building all
-//!   dependencies. Note that operations that return [`Tool`]s such as
-//!   [`Build::get_compiler`] may produce less accurate results as in some cases `cc` runs
-//!   commands in order to locate compilers. Additionally, this does nothing to prevent
+//!   dependencies. Compiler and automatic archiver discovery also return an error,
+//!   because locating tools can require running commands. This does nothing to prevent
 //!   users from running [`Tool::to_command`] and executing the [`Command`] themselves.
 //! * `RUSTC_WRAPPER` - If set, the specified command will be prefixed to the compiler
 //!   command. This is useful for projects that want to use
@@ -288,6 +287,10 @@ pub mod windows_registry {
     /// Note that this function always returns `None` for non-MSVC targets (if a
     /// full target name was specified).
     pub fn find(arch_or_target: &str, tool: &str) -> Option<std::process::Command> {
+        crate::Build::new()
+            .cargo_metadata(false)
+            .check_enabled()
+            .ok()?;
         ::find_msvc_tools::find(arch_or_target, tool)
     }
 
@@ -315,6 +318,10 @@ pub mod windows_registry {
     /// This is used by the cmake crate to figure out the correct
     /// generator.
     pub fn find_vs_version() -> Result<VsVers, String> {
+        crate::Build::new()
+            .cargo_metadata(false)
+            .check_enabled()
+            .map_err(|e| e.to_string())?;
         ::find_msvc_tools::find_vs_version().map(|vers| match vers {
             #[allow(deprecated)]
             ::find_msvc_tools::VsVers::Vs12 => VsVers::Vs12,
@@ -331,6 +338,10 @@ pub mod windows_registry {
     /// operation (finding a MSVC tool in a local install) but instead returns a
     /// [`Tool`](crate::Tool) which may be introspected.
     pub fn find_tool(arch_or_target: &str, tool: &str) -> Option<crate::Tool> {
+        crate::Build::new()
+            .cargo_metadata(false)
+            .check_enabled()
+            .ok()?;
         ::find_msvc_tools::find_tool(arch_or_target, tool).map(crate::Tool::from_find_msvc_tools)
     }
 }
@@ -354,6 +365,13 @@ use flags::*;
 struct CompilerFlag {
     compiler: Box<Path>,
     flag: Box<OsStr>,
+    target: Option<Arc<str>>,
+    host: Option<Arc<str>>,
+    cpp: bool,
+    cuda: bool,
+    env: Vec<(Arc<OsStr>, Arc<OsStr>)>,
+    tool_env: Vec<(OsString, OsString)>,
+    shell_escaped_flags: bool,
 }
 
 enum PrefixMapFlag {
@@ -1554,16 +1572,27 @@ impl Build {
         }
     }
 
+    fn flag_cache_key(&self, tool: &Tool, flag: &OsStr) -> CompilerFlag {
+        CompilerFlag {
+            compiler: tool.path().into(),
+            flag: flag.into(),
+            target: self.target.clone(),
+            host: self.host.clone(),
+            cpp: self.cpp,
+            cuda: self.cuda,
+            env: self.env.clone(),
+            tool_env: tool.env.clone(),
+            shell_escaped_flags: self.get_shell_escaped_flags(),
+        }
+    }
+
     fn is_flag_supported_inner(
         &self,
         flag: &OsStr,
         tool: &Tool,
         target: &TargetInfo<'_>,
     ) -> Result<bool, Error> {
-        let compiler_flag = CompilerFlag {
-            compiler: tool.path().into(),
-            flag: flag.into(),
-        };
+        let compiler_flag = self.flag_cache_key(tool, flag);
 
         if let Some(is_supported) = self
             .build_cache
@@ -1587,6 +1616,7 @@ impl Build {
                 .debug(false)
                 .cpp(self.cpp)
                 .cuda(self.cuda)
+                .shell_escaped_flags(self.get_shell_escaped_flags())
                 .out_dir(&*probe.dir)
                 .inherit_rustflags(false)
                 .inherit_trim_paths(false)
@@ -1918,12 +1948,7 @@ impl Build {
     }
 
     fn compile_objects(&self, objs: &[Object]) -> Result<(), Error> {
-        if self.is_disabled() {
-            return Err(Error::new(
-                ErrorKind::Disabled,
-                "the `cc` crate's functionality has been disabled by the `CC_FORCE_DISABLE` environment variable.",
-            ));
-        }
+        self.check_enabled()?;
 
         #[cfg(feature = "parallel")]
         if objs.len() > 1 {
@@ -1936,6 +1961,17 @@ impl Build {
         for obj in objs {
             let mut cmd = self.create_compile_object_cmd(obj)?;
             run(&mut cmd, &self.cargo_output)?;
+        }
+
+        Ok(())
+    }
+
+    fn check_enabled(&self) -> Result<(), Error> {
+        if self.is_disabled() {
+            return Err(Error::new(
+                ErrorKind::Disabled,
+                "the `cc` crate's functionality has been disabled by the `CC_FORCE_DISABLE` environment variable.",
+            ));
         }
 
         Ok(())
@@ -3241,6 +3277,7 @@ impl Build {
     }
 
     fn get_base_compiler(&self) -> Result<Tool, Error> {
+        self.check_enabled()?;
         let out_dir = self.get_out_dir().ok();
         let out_dir = out_dir.as_deref();
 
@@ -3753,6 +3790,7 @@ impl Build {
         env: &str,
         tool: &str,
     ) -> Result<(Command, PathBuf), Error> {
+        self.check_enabled()?;
         let target = self.get_target()?;
         let mut name = PathBuf::new();
         let tool_opt: Option<Command> = self
@@ -4268,7 +4306,7 @@ impl Build {
     /// (`Build::env` applies to child processes, not to `cc` itself).
     fn get_env_overridable(&self, key: &str) -> Option<Cow<'_, OsStr>> {
         // Try to look up in overrides first.
-        if let Some((_key, val)) = self.env.iter().find(|(k, _)| k.as_ref() == key) {
+        if let Some((_key, val)) = self.env.iter().rev().find(|(k, _)| k.as_ref() == key) {
             return Some(Cow::Borrowed(&**val));
         }
 
@@ -4338,7 +4376,14 @@ impl Build {
 
                 let var = var.to_string_lossy();
                 if self.get_shell_escaped_flags() {
-                    res.extend(Shlex::new(&var));
+                    let mut words = Shlex::new(&var);
+                    res.extend(&mut words);
+                    if words.had_error {
+                        return Err(Error::new(
+                            ErrorKind::InvalidArgument,
+                            format!("invalid shell quoting in {env}"),
+                        ));
+                    }
                 } else {
                     res.extend(var.split_ascii_whitespace().map(ToString::to_string));
                 }
@@ -4866,6 +4911,62 @@ fn check_exe(mut exe: PathBuf) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flag_cache_distinguishes_configuration() {
+        let build = Build::new();
+        let tool = Tool::with_family("cc".into(), ToolFamily::Gnu);
+        let mut other = build.clone();
+        other.cpp(true);
+        assert_ne!(
+            build.flag_cache_key(&tool, OsStr::new("-flag")),
+            other.flag_cache_key(&tool, OsStr::new("-flag"))
+        );
+    }
+
+    #[test]
+    fn malformed_env_flags_return_error() {
+        let mut build = Build::new();
+        build
+            .target("x86_64-unknown-linux-gnu")
+            .host("x86_64-unknown-linux-gnu")
+            .shell_escaped_flags(true)
+            .cargo_metadata(false);
+        if env::var_os("CC_REVIEW_FLAGS").is_none() {
+            return;
+        }
+        assert!(build.envflags("CC_REVIEW_FLAGS").is_err());
+    }
+
+    #[test]
+    fn env_override_uses_last_value() {
+        let mut build = Build::new();
+        build.env("SDKROOT", "first").env("SDKROOT", "last");
+        assert_eq!(
+            build.get_env_overridable("SDKROOT").as_deref(),
+            Some(OsStr::new("last"))
+        );
+    }
+
+    #[test]
+    fn disabled_compiler_lookup_returns_disabled() {
+        let mut build = Build::new();
+        build.cargo_metadata(false);
+        if !build.is_disabled() {
+            return;
+        }
+        assert!(matches!(
+            build.get_base_compiler().unwrap_err().kind,
+            ErrorKind::Disabled
+        ));
+        assert!(matches!(
+            build
+                .get_base_archiver_variant("AR", "ar")
+                .unwrap_err()
+                .kind,
+            ErrorKind::Disabled
+        ));
+    }
 
     #[test]
     fn test_android_clang_compiler_uses_target_arg_internally() {
